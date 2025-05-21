@@ -6,9 +6,10 @@ import argparse
 def rename_sessions(root_dir):
     """
     btp_preproc 루트 아래, 각 PGBM-xxx 디렉토리 내의
-    세션 폴더명을 'MM-DD-YYYY' 형식의 날짜만 남기도록 바꿉니다.
+    세션 폴더명을 'YYYY-MM-DD' 형식의 날짜만 남기도록 바꿉니다.
     """
-    date_re = re.compile(r"^(\d{2}-\d{2}-\d{4})")
+    # MM-DD-YYYY 형태를 잡아내는 정규식
+    date_re = re.compile(r"^(\d{2})-(\d{2})-(\d{4})")
     for case in sorted(os.listdir(root_dir)):
         case_dir = os.path.join(root_dir, case)
         if not os.path.isdir(case_dir):
@@ -24,12 +25,15 @@ def rename_sessions(root_dir):
                 print(f"⚠️  '{sess}' 에서 날짜를 찾을 수 없습니다. 건너뜁니다.")
                 continue
 
-            new_name = m.group(1)  # ex: "04-02-1992"
+            mm, dd, yyyy = m.groups()
+            new_name = f"{yyyy}-{mm}-{dd}"         # YYYY-MM-DD
             new_path = os.path.join(case_dir, new_name)
+
+            # 이미 같은 이름이면 스킵
             if os.path.abspath(new_path) == os.path.abspath(sess_path):
-                # 이미 원하는 이름이면 패스
                 continue
 
+            # 충돌 방지: 같은 이름 폴더가 이미 있으면 스킵
             if os.path.exists(new_path):
                 print(f"⚠️  대상 폴더 '{new_name}' 이(가) 이미 존재합니다. '{sess}' 건너뜁니다.")
             else:
@@ -38,7 +42,7 @@ def rename_sessions(root_dir):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
-        description="Rename BTP session folders to date-only names (MM-DD-YYYY)."
+        description="Rename BTP session folders to date-only names (YYYY-MM-DD)."
     )
     p.add_argument(
         "--root",
