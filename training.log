@@ -1,0 +1,26 @@
+2025-05-28 20:12:00,733 [INFO] 메타데이터 로드 완료: 20개 환자
+2025-05-28 20:12:01,238 [INFO] 총 4800개 슬라이스 샘플 생성 완료
+2025-05-28 20:12:01,264 [INFO] 사용 장치: cpu
+2025-05-28 20:12:01,267 [ERROR] 훈련 중 심각한 오류 발생
+Traceback (most recent call last):
+  File "/mnt/ssd/brain-tumor-prediction/models/test_model2.py", line 185, in train_safe_model
+    model = TumorGrowthPredictor2D().to(device)
+  File "/mnt/ssd/brain-tumor-prediction/models/test_model2.py", line 148, in __init__
+    self.st_lstm = STConvLSTM2D(32+8, hidden_dims, kernels)
+NameError: name 'STConvLSTM2D' is not defined
+2025-05-28 20:12:01,267 [ERROR] 치명적 오류로 인해 프로그램 종료: name 'STConvLSTM2D' is not defined
+2025-05-28 20:21:08,498 [INFO] 메타데이터 로드 완료: 20개 환자
+2025-05-28 20:21:08,995 [INFO] 총 4800개 슬라이스 샘플 생성 완료
+2025-05-28 20:21:09,020 [INFO] 사용 장치: cpu
+2025-05-28 20:21:09,024 [ERROR] 훈련 중 심각한 오류 발생
+Traceback (most recent call last):
+  File "/mnt/ssd/brain-tumor-prediction/models/test_model2.py", line 213, in train_safe_model
+    model = TumorGrowthPredictor2D().to(device)
+  File "/mnt/ssd/brain-tumor-prediction/models/test_model2.py", line 170, in __init__
+    self.st_lstm = STConvLSTM2D(  # 수정된 부분
+  File "/mnt/ssd/brain-tumor-prediction/models/test_model2.py", line 121, in __init__
+    self.layers = nn.ModuleList([
+  File "/mnt/ssd/brain-tumor-prediction/models/test_model2.py", line 122, in <listcomp>
+    STConvLSTMCell2D(
+NameError: name 'STConvLSTMCell2D' is not defined
+2025-05-28 20:21:09,024 [ERROR] 치명적 오류로 인해 프로그램 종료: name 'STConvLSTMCell2D' is not defined

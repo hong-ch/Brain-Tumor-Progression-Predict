@@ -135,7 +135,7 @@ if __name__ == "__main__":
                    help="Output folder for preprocessed NIfTI files")
     p.add_argument("--spacing",     nargs=2, type=float, default=[1,1],
                    help="In-plane spacing (X Y) to resample to, mm")
-    p.add_argument("--target_shape",nargs=2, type=int, default=[240,240],
+    p.add_argument("--target_shape",nargs=2, type=int, default=[224,224],
                    help="Desired in-plane shape (Y X)")
     p.add_argument("--target_z",    type=int, default=22,
                    help="Desired number of Z slices after crop/pad")

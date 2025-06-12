@@ -1,7 +1,7 @@
 import os
 
 # 최상위 경로 설정
-base_dir = '/mnt/ssd/brain-tumor-prediction/data/btp_reg_flirt_all_fixed22_nostrip'
+base_dir = '/mnt/ssd/brain-tumor-prediction/data/btp_reg_flirt_all_224_nostrip'
 
 # PGBM-001 ~ PGBM-020 반복
 for patient_folder in sorted(os.listdir(base_dir)):

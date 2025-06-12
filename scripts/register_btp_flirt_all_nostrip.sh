@@ -9,8 +9,8 @@ export OMP_NUM_THREADS=3
 export FSLPARALLEL=3
 
 # ── 2) 경로 설정 ──
-INPUT_ROOT="data/btp_preproc_fixed22"
-OUTPUT_ROOT="data/btp_reg_flirt_all_fixed22_nostrip"
+INPUT_ROOT="data/btp_preproc_224"
+OUTPUT_ROOT="data/btp_reg_flirt_all_224_nostrip"
 mkdir -p "$OUTPUT_ROOT"
 
 # ── 3) 케이스별 반복 ──

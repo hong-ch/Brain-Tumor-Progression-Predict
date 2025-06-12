@@ -41,7 +41,7 @@ for case_path in ${INPUT_ROOT}/PGBM-*; do
 
   # 5) FLIRT: 종양 마스크도 같은 affine 적용 (nearest‐neighbour)
   flirt -in  "$moving_dir/mask.nii.gz" \
-        -ref "$fixed_dir/mask.nii.gz" \
+        -ref "$fixed_dir/t1ce.nii.gz" \
         -init "$moving_out/affine.mat" \
         -applyxfm \
         -interp nearestneighbour \

@@ -1,391 +1,316 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import nibabel as nib
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
-from sklearn.metrics import mean_squared_error
-import os
+import numpy as np
 import pandas as pd
-from scipy import ndimage
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision.models import resnet50
+from torchvision.transforms import functional as TF
+from sklearn.model_selection import GroupShuffleSplit
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-class GliomaVolumeDataset(Dataset):
-    """
-    뇌종양 MRI 데이터셋 클래스
-    반응-확산 모델 기반 합성 데이터 로딩 지원
-    """
-    def __init__(self, data_dir, csv_file, transform=None):
-        self.data_dir = data_dir
-        self.data_info = pd.read_csv(csv_file)
-        self.transform = transform
+class EnhancedBrainTumorDataset(Dataset):
+    def __init__(self, root_dir, csv_path, augment=False):
+        self.root_dir = root_dir
+        self.augment = augment
+        self.meta_df = pd.read_csv(csv_path)
+        self.meta_df['Patient ID'] = self.meta_df['Patient ID'].astype(str)
+        self.days_gap_dict = dict(zip(self.meta_df['Patient ID'], self.meta_df.get('Days Gap', pd.Series(1, index=self.meta_df.index))))
+        self.sequences, self.patient_ids = [], []
+        self.size_stats, self.growth_stats = {}, {}
+        self._build_sequences()
+        self._calculate_task_stats()
 
-    def __len__(self):
-        return len(self.data_info)
+    def _validate_folder(self, path):
+        return all(os.path.exists(os.path.join(path, f)) for f in ['flair.nii.gz', 't1ce.nii.gz', 'mask.nii.gz'])
+
+    def _get_valid_timepoints(self, patient_path):
+        return [{'date': d, 'path': os.path.join(patient_path, d)} for d in sorted(os.listdir(patient_path))
+                if os.path.isdir(os.path.join(patient_path, d)) and self._validate_folder(os.path.join(patient_path, d))]
+
+    def _build_sequences(self):
+        for _, row in self.meta_df.iterrows():
+            pid = str(row['Patient ID'])
+            ppath = os.path.join(self.root_dir, pid)
+            times = self._get_valid_timepoints(ppath)
+            if len(times) < 2:
+                continue
+            gap = self.days_gap_dict.get(pid, 1)
+            for i in range(len(times) - 1):
+                im1 = nib.load(os.path.join(times[i]['path'], 'mask.nii.gz')).get_fdata()
+                im2 = nib.load(os.path.join(times[i + 1]['path'], 'mask.nii.gz')).get_fdata()
+                for z in range(22):
+                    if np.sum(im1[z]) == 0 and np.sum(im2[z]) == 0:
+                        continue
+                    self.sequences.append({'input_path': times[i]['path'], 'target_path': times[i + 1]['path'],
+                                           'patient_id': pid, 'slice_idx': z, 'days_gap': gap})
+                    self.patient_ids.append(pid)
+
+    def _calculate_task_stats(self):
+        sizes, growths = [], []
+        for seq in self.sequences:
+            mask = nib.load(os.path.join(seq['input_path'], 'mask.nii.gz')).get_fdata()[seq['slice_idx']]
+            target = nib.load(os.path.join(seq['target_path'], 'mask.nii.gz')).get_fdata()[seq['slice_idx']]
+            size0, size1 = np.sum(mask), np.sum(target)
+            growth = (size1 - size0) / seq['days_gap']
+            sizes.append(size1)
+            growths.append(growth)
+        self.size_stats = {'min': np.min(sizes), 'max': np.max(sizes)}
+        self.growth_stats = {'mean': np.mean(growths), 'std': np.std(growths)}
+
+    def _preprocess_mask(self, m):
+        return (np.nan_to_num(m, nan=0.0) > 0).astype(np.float32)
+
+    def _augment_tensor(self, t):
+        if random.random() < 0.5:
+            t = TF.hflip(t)
+        if random.random() < 0.5:
+            t = TF.vflip(t)
+        angle = random.uniform(-15, 15)
+        t = TF.rotate(t, angle)
+        return t
 
     def __getitem__(self, idx):
-        # MRI 이미지 로딩 (T1, T1Gd, T2, FLAIR)
-        patient_id = self.data_info.iloc[idx]['patient_id']
-        timepoint = self.data_info.iloc[idx]['timepoint']
+        seq = self.sequences[idx]
+        flair = nib.load(os.path.join(seq['input_path'], 'flair.nii.gz')).get_fdata()[seq['slice_idx']]
+        t1ce = nib.load(os.path.join(seq['input_path'], 't1ce.nii.gz')).get_fdata()[seq['slice_idx']]
+        mask = self._preprocess_mask(nib.load(os.path.join(seq['input_path'], 'mask.nii.gz')).get_fdata()[seq['slice_idx']])
+        target = self._preprocess_mask(nib.load(os.path.join(seq['target_path'], 'mask.nii.gz')).get_fdata()[seq['slice_idx']])
 
-        # 다중 모달리티 MRI 로딩
-        mri_path = os.path.join(self.data_dir, f"{patient_id}_{timepoint}.npy")
-        mri_data = np.load(mri_path)  # Shape: (C, H, W, D)
+        input_tensor = torch.stack([torch.tensor(flair), torch.tensor(t1ce), torch.tensor(mask)])
+        if self.augment:
+            input_tensor = self._augment_tensor(input_tensor)
 
-        # 종양 윤곽선 추출 (임계값 기반)
-        contour_1 = self.extract_contour(mri_data, threshold=0.8)  # 강화 코어
-        contour_2 = self.extract_contour(mri_data, threshold=0.3)  # 부종 영역
+        size0, size1 = np.sum(mask), np.sum(target)
+        raw_growth = (size1 - size0) / seq['days_gap']
 
-        # 미래 시점 종양 부피 (ground truth)
-        future_volume = self.data_info.iloc[idx]['future_volume']
+        denom_size = self.size_stats['max'] - self.size_stats['min']
+        denom_growth = self.growth_stats['std']
 
-        # 확산성과 증식 매개변수
-        diffusivity = self.data_info.iloc[idx]['diffusivity']
-        proliferation = self.data_info.iloc[idx]['proliferation']
+        norm_size = (size1 - self.size_stats['min']) / denom_size if denom_size != 0 else 0.0
+        norm_growth = (raw_growth - self.growth_stats['mean']) / denom_growth if denom_growth != 0 else 0.0
 
-        sample = {
-            'mri': torch.FloatTensor(mri_data),
-            'contour_1': torch.FloatTensor(contour_1),
-            'contour_2': torch.FloatTensor(contour_2),
-            'future_volume': torch.FloatTensor([future_volume]),
-            'diffusivity': torch.FloatTensor([diffusivity]),
-            'proliferation': torch.FloatTensor([proliferation])
-        }
+        return input_tensor.float(), torch.tensor([norm_size], dtype=torch.float32), torch.tensor([norm_growth], dtype=torch.float32)
 
-        return sample
+    def __len__(self):
+        return len(self.sequences)
 
-    def extract_contour(self, mri_data, threshold):
-        """
-        임계값 기반 종양 윤곽선 추출
-        """
-        # 마지막 채널이 세그멘테이션이라고 가정
-        segmentation = mri_data[-1]
-        contour = (segmentation > threshold).astype(np.float32)
-        return contour
-
-class ReactionDiffusionNet(nn.Module):
-    """
-    반응-확산 뇌종양 성장 모델링을 위한 3D CNN
-    두 개의 주요 작업: 세포 밀도 재구성 + 매개변수 추정
-    """
-    def __init__(self, input_channels=4, num_classes=1):
-        super(ReactionDiffusionNet, self).__init__()
-
-        # 인코더 (특징 추출)
-        self.encoder = nn.Sequential(
-            # 첫 번째 블록
-            nn.Conv3d(input_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm3d(32),
+class HybridTumorPredictor(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.shared_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv3d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-
-            # 두 번째 블록
-            nn.Conv3d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-
-            # 세 번째 블록
-            nn.Conv3d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
-
-        # 세포 밀도 재구성을 위한 디코더
-        self.density_decoder = nn.Sequential(
-            nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-
-            nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-
-            nn.ConvTranspose3d(32, 16, kernel_size=2, stride=2),
-            nn.BatchNorm3d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(16, 1, kernel_size=3, padding=1),
-            nn.Sigmoid()
+        self.size_branch = nn.Sequential(
+            *list(resnet50().layer1.children()),
+            *list(resnet50().layer2.children()),
+            nn.AdaptiveAvgPool2d((1,1))
         )
-
-        # 매개변수 추정을 위한 회귀 헤드
-        self.global_pool = nn.AdaptiveAvgPool3d(1)
-        self.parameter_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(64, 32),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(32, 2)  # 확산성과 증식률
+        self.growth_branch = nn.Sequential(
+            *list(resnet50().layer1.children()),
+            *list(resnet50().layer2.children()),
+            nn.AdaptiveAvgPool2d((1,1))
         )
-
-        # 부피 예측을 위한 회귀 헤드
-        self.volume_head = nn.Sequential(
-            nn.Linear(130, 64),  # 128 (특징) + 2 (매개변수)
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(64, 32),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(32, 1)  # 미래 부피
+        self.size_head = nn.Sequential(
+            nn.Dropout(0.6),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, 1)
+        )
+        self.growth_head = nn.Sequential(
+            nn.Dropout(0.6),
+            nn.Linear(512, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
-        # 특징 추출
-        features = self.encoder(x)
+        x = self.shared_conv(x)
+        s_feat = self.size_branch(x)
+        g_feat = self.growth_branch(x)
+        s_feat = s_feat.squeeze(-1).squeeze(-1)
+        g_feat = g_feat.squeeze(-1).squeeze(-1)
+        return self.size_head(s_feat), self.growth_head(g_feat)
 
-        # 세포 밀도 재구성
-        density_map = self.density_decoder(features)
+def dynamic_weighted_loss(p1, p2, y1, y2, epoch, max_epoch):
+    mse = nn.MSELoss(reduction='none')
+    huber = nn.HuberLoss(reduction='none')
+    size_scale = torch.std(y1.detach(), unbiased=False)
+    size_scale = size_scale if size_scale > 1e-6 else torch.tensor(1.0, device=y1.device)
+    growth_scale = torch.std(y2.detach(), unbiased=False)
+    growth_scale = growth_scale if growth_scale > 1e-6 else torch.tensor(1.0, device=y2.device)
+    progress = epoch / max_epoch
+    rare_weight = 1.0 + (3.0 - 1.0) * (1 - torch.cos(torch.tensor(progress * np.pi))) / 2
+    s_rare = ((y1 < torch.quantile(y1, 0.1)) | (y1 > torch.quantile(y1, 0.9))).float()
+    g_rare = ((y2 < torch.quantile(y2, 0.1)) | (y2 > torch.quantile(y2, 0.9))).float()
+    l_size = (rare_weight * s_rare * mse(p1, y1) / size_scale).mean()
+    l_growth = (rare_weight * g_rare * huber(p2, y2) / growth_scale).mean()
+    return l_size + 1.2 * l_growth
+    
+# --- EarlyStopping ---
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
 
-        # 전역 특징 추출
-        global_features = self.global_pool(features).view(features.size(0), -1)
-
-        # 매개변수 추정
-        parameters = self.parameter_head(global_features)
-
-        # 매개변수와 전역 특징 결합
-        combined_features = torch.cat([global_features, parameters], dim=1)
-
-        # 부피 예측
-        volume_pred = self.volume_head(combined_features)
-
-        return {
-            'density_map': density_map,
-            'parameters': parameters,
-            'volume': volume_pred
-        }
-
-class GliomaGrowthPredictor:
-    """
-    뇌종양 성장 예측 시스템 메인 클래스
-    """
-    def __init__(self, model_config=None):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = ReactionDiffusionNet().to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=10
-        )
-
-    def multi_task_loss(self, predictions, targets, alpha=1.0, beta=0.5, gamma=0.5):
-        """
-        다중 작업 손실 함수
-        - 세포 밀도 재구성 손실
-        - 매개변수 추정 손실
-        - 부피 예측 손실
-        """
-        density_loss = F.mse_loss(predictions['density_map'], targets['density_target'])
-        param_loss = F.mse_loss(predictions['parameters'], targets['parameters'])
-        volume_loss = F.mse_loss(predictions['volume'], targets['future_volume'])
-
-        total_loss = alpha * density_loss + beta * param_loss + gamma * volume_loss
-
-        return total_loss, {
-            'density_loss': density_loss.item(),
-            'param_loss': param_loss.item(),
-            'volume_loss': volume_loss.item(),
-            'total_loss': total_loss.item()
-        }
-
-    def train_epoch(self, train_loader):
-        """
-        한 에포크 훈련
-        """
-        self.model.train()
-        epoch_losses = []
-
-        for batch_idx, batch in enumerate(train_loader):
-            # 데이터를 GPU로 이동
-            mri = batch['mri'].to(self.device)
-            contour_1 = batch['contour_1'].to(self.device)
-            contour_2 = batch['contour_2'].to(self.device)
-
-            # 입력 데이터 결합 (MRI + 윤곽선)
-            input_data = torch.cat([mri, contour_1.unsqueeze(1), contour_2.unsqueeze(1)], dim=1)
-
-            # 타겟 데이터 준비
-            targets = {
-                'density_target': batch['contour_2'].to(self.device).unsqueeze(1),  # 더 큰 윤곽선을 타겟으로
-                'parameters': torch.stack([batch['diffusivity'], batch['proliferation']], dim=1).to(self.device),
-                'future_volume': batch['future_volume'].to(self.device)
-            }
-
-            # 순전파
-            self.optimizer.zero_grad()
-            predictions = self.model(input_data)
-
-            # 손실 계산
-            loss, loss_dict = self.multi_task_loss(predictions, targets)
-
-            # 역전파
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-
-            epoch_losses.append(loss_dict)
-
-            if batch_idx % 10 == 0:
-                print(f'Batch {batch_idx}: Loss = {loss.item():.4f}')
-
-        return epoch_losses
-
-    def validate(self, val_loader):
-        """
-        검증
-        """
-        self.model.eval()
-        val_losses = []
-        volume_predictions = []
-        volume_targets = []
-
-        with torch.no_grad():
-            for batch in val_loader:
-                mri = batch['mri'].to(self.device)
-                contour_1 = batch['contour_1'].to(self.device)
-                contour_2 = batch['contour_2'].to(self.device)
-
-                input_data = torch.cat([mri, contour_1.unsqueeze(1), contour_2.unsqueeze(1)], dim=1)
-
-                targets = {
-                    'density_target': batch['contour_2'].to(self.device).unsqueeze(1),
-                    'parameters': torch.stack([batch['diffusivity'], batch['proliferation']], dim=1).to(self.device),
-                    'future_volume': batch['future_volume'].to(self.device)
-                }
-
-                predictions = self.model(input_data)
-                loss, loss_dict = self.multi_task_loss(predictions, targets)
-
-                val_losses.append(loss_dict)
-                volume_predictions.extend(predictions['volume'].cpu().numpy())
-                volume_targets.extend(targets['future_volume'].cpu().numpy())
-
-        # 부피 예측 정확도 계산
-        volume_mse = mean_squared_error(volume_targets, volume_predictions)
-        volume_mae = np.mean(np.abs(np.array(volume_targets) - np.array(volume_predictions)))
-
-        return val_losses, volume_mse, volume_mae
-
-    def predict_future_volume(self, mri_path, contour_threshold_1=0.8, contour_threshold_2=0.3):
-        """
-        단일 MRI에서 미래 종양 부피 예측
-        """
-        self.model.eval()
-
-        # MRI 데이터 로딩
-        if mri_path.endswith('.npy'):
-            mri_data = np.load(mri_path)
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.counter = 0
+        elif self.best_loss - val_loss > self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
         else:
-            # NIfTI 파일 처리
-            nii_data = nib.load(mri_path)
-            mri_data = nii_data.get_fdata()
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
 
-        # 윤곽선 추출
-        segmentation = mri_data[-1]
-        contour_1 = (segmentation > contour_threshold_1).astype(np.float32)
-        contour_2 = (segmentation > contour_threshold_2).astype(np.float32)
+# --- Train Function ---
+def train_hybrid_model(data_dir, csv_path, epochs=30, batch_size=8, device=None, patience=5):
+    dataset = EnhancedBrainTumorDataset(data_dir, csv_path, augment=True)
+    patients = sorted(list(set(dataset.patient_ids)))
+    gss1 = GroupShuffleSplit(n_splits=1, train_size=0.75, random_state=42)
+    train_val_idx, test_idx = next(gss1.split(patients, groups=patients))
+    train_val_pids = [patients[i] for i in train_val_idx]
+    test_pids = [patients[i] for i in test_idx]
 
-        # 텐서 변환 및 배치 차원 추가
-        mri_tensor = torch.FloatTensor(mri_data).unsqueeze(0).to(self.device)
-        contour_1_tensor = torch.FloatTensor(contour_1).unsqueeze(0).unsqueeze(0).to(self.device)
-        contour_2_tensor = torch.FloatTensor(contour_2).unsqueeze(0).unsqueeze(0).to(self.device)
+    gss2 = GroupShuffleSplit(n_splits=1, train_size=0.9, random_state=42)
+    train_idx, val_idx = next(gss2.split(train_val_pids, groups=train_val_pids))
+    train_pids = [train_val_pids[i] for i in train_idx]
+    val_pids = [train_val_pids[i] for i in val_idx]
 
-        input_data = torch.cat([mri_tensor, contour_1_tensor, contour_2_tensor], dim=1)
+    train_indices = [i for i, pid in enumerate(dataset.patient_ids) if pid in train_pids]
+    val_indices = [i for i, pid in enumerate(dataset.patient_ids) if pid in val_pids]
+    test_indices = [i for i, pid in enumerate(dataset.patient_ids) if pid in test_pids]
 
+    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(Subset(dataset, val_indices), batch_size=batch_size)
+    test_loader = DataLoader(Subset(dataset, test_indices), batch_size=batch_size)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = HybridTumorPredictor().to(device)
+    opt = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    early_stopping = EarlyStopping(patience=patience, min_delta=0.0)
+
+    for epoch in range(epochs):
+        model.train()
+        running_train_loss = 0.0
+        for batch_idx, (x, y1, y2) in enumerate(train_loader):
+            x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
+            opt.zero_grad()
+            p1, p2 = model(x)
+            loss = dynamic_weighted_loss(p1, p2, y1, y2, epoch, epochs)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            running_train_loss += loss.item()
+            print(f"Epoch {epoch+1}/{epochs} | Train Batch {batch_idx+1}/{len(train_loader)} | Loss: {loss.item():.4f}")
+
+        scheduler.step()
+
+        # Validation step (배치별 loss 출력)
+        model.eval()
+        val_loss = 0.0
         with torch.no_grad():
-            predictions = self.model(input_data)
+            for val_batch_idx, (x_val, y1_val, y2_val) in enumerate(val_loader):
+                x_val, y1_val, y2_val = x_val.to(device), y1_val.to(device), y2_val.to(device)
+                p1_val, p2_val = model(x_val)
+                batch_loss = dynamic_weighted_loss(p1_val, p2_val, y1_val, y2_val, epoch, epochs)
+                val_loss += batch_loss.item()
+                print(f"Epoch {epoch+1}/{epochs} | Val Batch {val_batch_idx+1}/{len(val_loader)} | Loss: {batch_loss.item():.4f}")
+        avg_val_loss = val_loss / len(val_loader)
 
-            future_volume = predictions['volume'].cpu().numpy()[0, 0]
-            estimated_params = predictions['parameters'].cpu().numpy()[0]
-            density_map = predictions['density_map'].cpu().numpy()[0, 0]
+        # Early stopping 체크
+        early_stopping(avg_val_loss)
+        print(f"Epoch {epoch+1}/{epochs} | Avg Val Loss: {avg_val_loss:.4f} | EarlyStop Counter: {early_stopping.counter}")
+        if early_stopping.early_stop:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
 
-        return {
-            'future_volume': future_volume,
-            'diffusivity': estimated_params[0],
-            'proliferation': estimated_params[1],
-            'density_map': density_map
-        }
+    # Test set 평가
+    model.eval()
+    test_loss = 0.0
+    with torch.no_grad():
+        for test_batch_idx, (x_test, y1_test, y2_test) in enumerate(test_loader):
+            x_test, y1_test, y2_test = x_test.to(device), y1_test.to(device), y2_test.to(device)
+            p1_test, p2_test = model(x_test)
+            batch_loss = dynamic_weighted_loss(p1_test, p2_test, y1_test, y2_test, epoch, epochs)
+            test_loss += batch_loss.item()
+            print(f"Test Batch {test_batch_idx+1}/{len(test_loader)} | Loss: {batch_loss.item():.4f}")
+    avg_test_loss = test_loss / len(test_loader)
+    print(f"Final Test Avg Loss: {avg_test_loss:.4f}")
 
-    def train(self, train_loader, val_loader, num_epochs=100):
-        """
-        모델 훈련
-        """
-        best_val_loss = float('inf')
+    return model, (train_loader, val_loader, test_loader), dataset
 
-        for epoch in range(num_epochs):
-            print(f'\nEpoch {epoch+1}/{num_epochs}')
+# --- 평가 및 시각화 ---
+def evaluate_model(model, loader, device, dataset):
+    model.eval()
+    size_pred, size_true = [], []
+    growth_pred, growth_true = [], []
 
-            # 훈련
-            train_losses = self.train_epoch(train_loader)
-            avg_train_loss = np.mean([loss['total_loss'] for loss in train_losses])
+    with torch.no_grad():
+        for x, y1, y2 in loader:
+            x, y1, y2 = x.to(device), y1.to(device), y2.to(device)
+            p1, p2 = model(x)
+            size_pred.extend(p1.cpu().numpy())
+            size_true.extend(y1.cpu().numpy())
+            growth_pred.extend(p2.cpu().numpy())
+            growth_true.extend(y2.cpu().numpy())
 
-            # 검증
-            val_losses, volume_mse, volume_mae = self.validate(val_loader)
-            avg_val_loss = np.mean([loss['total_loss'] for loss in val_losses])
+    size_true = np.array(size_true) * (dataset.size_stats['max'] - dataset.size_stats['min']) + dataset.size_stats['min']
+    size_pred = np.array(size_pred) * (dataset.size_stats['max'] - dataset.size_stats['min']) + dataset.size_stats['min']
+    growth_true = np.array(growth_true) * dataset.growth_stats['std'] + dataset.growth_stats['mean']
+    growth_pred = np.array(growth_pred) * dataset.growth_stats['std'] + dataset.growth_stats['mean']
 
-            print(f'Train Loss: {avg_train_loss:.4f}')
-            print(f'Val Loss: {avg_val_loss:.4f}')
-            print(f'Volume MSE: {volume_mse:.4f}')
-            print(f'Volume MAE: {volume_mae:.4f}')
+    size_r2 = 1 - np.sum((size_true - size_pred)**2) / np.sum((size_true - np.mean(size_true))**2)
+    growth_mape = np.mean(np.abs((growth_true - growth_pred) / (growth_true + 1e-8))) * 100
 
-            # 학습률 조정
-            self.scheduler.step(avg_val_loss)
+    return {
+        'size_r2': size_r2,
+        'growth_mape': growth_mape,
+        'size_pred': size_pred,
+        'size_true': size_true,
+        'growth_pred': growth_pred,
+        'growth_true': growth_true
+    }
 
-            # 모델 저장
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'val_loss': avg_val_loss,
-                }, 'best_glioma_model.pth')
-                print(f'Best model saved with validation loss: {avg_val_loss:.4f}')
+def plot_enhanced_results(results):
+    plt.figure(figsize=(15,6))
+    plt.subplot(1,2,1)
+    sns.regplot(x=results['size_true'], y=results['size_pred'], scatter_kws={'alpha':0.3}, line_kws={'color':'red'})
+    plt.title(f"Size Prediction (R²={results['size_r2']:.3f})")
+    plt.xlabel('Actual Size')
+    plt.ylabel('Predicted Size')
+    plt.subplot(1,2,2)
+    sns.histplot(results['growth_true'] - results['growth_pred'], kde=True, bins=30)
+    plt.title(f"Growth Rate Error Distribution (MAPE={results['growth_mape']:.2f}%)")
+    plt.xlabel('Prediction Error')
+    plt.tight_layout()
+    plt.show()
 
-def main():
-    """
-    메인 실행 함수
-    """
-    # 데이터셋 경로 설정
-    data_dir = "path/to/synthetic_tumor_data"
-    train_csv = "train_data.csv"
-    val_csv = "val_data.csv"
-
-    # 데이터셋 생성
-    train_dataset = GliomaVolumeDataset(data_dir, train_csv)
-    val_dataset = GliomaVolumeDataset(data_dir, val_csv)
-
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=4)
-
-    # 모델 초기화 및 훈련
-    predictor = GliomaGrowthPredictor()
-    predictor.train(train_loader, val_loader, num_epochs=100)
-
-    # 예측 예시
-    test_mri_path = "path/to/test_mri.npy"
-    result = predictor.predict_future_volume(test_mri_path)
-
-    print(f"\n=== 예측 결과 ===")
-    print(f"미래 종양 부피: {result['future_volume']:.2f} mm³")
-    print(f"추정 확산성: {result['diffusivity']:.4f}")
-    print(f"추정 증식률: {result['proliferation']:.4f}")
-
-if __name__ == "__main__":
-    main()
+# --- Main ---
+if __name__ == '__main__':
+    data_dir = "/mnt/ssd/brain-tumor-prediction/data/btp_reg_flirt_all_fixed22_nostrip"
+    csv_path = "/mnt/ssd/brain-tumor-prediction/csv/btp_meta.csv"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    trained_model, loaders, dataset = train_hybrid_model(data_dir, csv_path, device=device, patience=5)
+    eval_results = evaluate_model(trained_model, loaders[2], device, dataset)
+    plot_enhanced_results(eval_results)
